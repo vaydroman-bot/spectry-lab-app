@@ -1,196 +1,405 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
+import anthropic
+import base64
+import io
+import os
 
-# ==========================================
-# 1. CONFIGURACIÓN Y ESTILO (V8 - Márgenes y Directo)
-# ==========================================
+# ─── CONFIGURACIÓN ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Spectry Lab", layout="wide", page_icon="🧪")
 
 st.markdown("""
-    <style>
-        /* Forzar scroll */
-        .main { overflow-y: scroll !important; }
-        
-        /* Ajustes de texto */
-        html, body, [class*="css"] { font-size: 14px; background-color: #0E1117; color: #E6E6E6; }
-        .block-container { padding-top: 1rem; padding-bottom: 3rem; }
-        
-        /* CAJA DE RESULTADO */
-        .resultado-final {
-            background-color: #111;
-            border: 2px solid #333;
-            border-radius: 10px;
-            padding: 15px;
-            text-align: center;
-            margin-top: 10px;
-        }
-        .similitud-valor {
-            font-size: 3rem;
-            font-weight: 900;
-            margin: 0;
-            text-shadow: 0px 0px 10px rgba(0,0,0,0.5);
-        }
-        
-        /* Colores del semáforo */
-        .verde { color: #00FF00; }
-        .amarillo { color: #FFD700; }
-        .rojo { color: #FF4444; }
+<style>
+  .main { overflow-y: scroll !important; }
+  html, body, [class*="css"] {
+    font-size: 14px; background-color: #0E1117; color: #E6E6E6;
+  }
+  .block-container { padding-top: 1rem; padding-bottom: 3rem; }
 
-        /* Instrucciones visuales */
-        .instruccion {
-            color: #888;
-            font-size: 0.8rem;
-            text-align: center;
-            margin-bottom: 5px;
-        }
-    </style>
+  .resultado-box {
+    background: #111; border: 2px solid #333; border-radius: 12px;
+    padding: 20px; text-align: center; margin: 10px 0;
+  }
+  .dE-val { font-size: 3.5rem; font-weight: 900; margin: 4px 0; line-height: 1; }
+  .verde   { color: #00FF00; }
+  .amarillo{ color: #FFD700; }
+  .rojo    { color: #FF4444; }
+
+  .chip {
+    display: inline-block; width: 26px; height: 26px;
+    border-radius: 4px; border: 1px solid #444;
+    margin: 2px; vertical-align: middle;
+  }
+  .swatch {
+    width: 100%; height: 70px; border-radius: 8px;
+    border: 1px solid #333;
+  }
+  .hint { color: #666; font-size: .78rem; text-align: center; margin-bottom: 3px; }
+</style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. DATOS
-# ==========================================
+# ─── SISTEMAS DE TINTES ───────────────────────────────────────────────────────
 SISTEMAS = {
-    "BESA Urki-Mix": {"negro": "9005", "blanco": "Blanco", "alu": "Aluminio", "ocre": "Ocre", "rojo": "Rojo"},
-    "NOVOL Spectral": {"negro": "SB-1000", "blanco": "SB-2000", "alu": "B-810", "ocre": "B-Ocre", "rojo": "B-Rojo"}
+    "BESA Urki-Mix": {
+        "negro": "9005", "blanco": "Blanco Base",
+        "aluminio": "Aluminio", "perla": "Perla Blanca",
+        "ocre": "Ocre Amarillo", "rojo": "Rojo",
+        "azul": "Azul", "verde": "Verde", "violeta": "Violeta",
+    },
+    "NOVOL Spectral": {
+        "negro": "SB-1000", "blanco": "SB-2000",
+        "aluminio": "B-810", "perla": "B-Perla",
+        "ocre": "B-Ocre", "rojo": "B-Rojo",
+        "azul": "B-Azul", "verde": "B-Verde", "violeta": "B-Violeta",
+    },
+    "Standox Standohyd": {
+        "negro": "W001", "blanco": "W040",
+        "aluminio": "W075", "perla": "W090",
+        "ocre": "W064", "rojo": "W036",
+        "azul": "W051", "verde": "W057", "violeta": "W058",
+    },
 }
 
-# ==========================================
-# 3. MOTOR GRÁFICO ROBUSTO (FIX INCLUIDO)
-# ==========================================
+# ─── ESTADO DE SESIÓN ─────────────────────────────────────────────────────────
+for clave, valor in {
+    "puntos_coche": [], "puntos_muestra": [],
+    "rgb_coche": [], "rgb_muestra": [],
+    "prev_coche": None, "prev_muestra": None,
+    "b64_coche": None, "b64_muestra": None,
+    "resultado_ia": None,
+}.items():
+    if clave not in st.session_state:
+        st.session_state[clave] = valor
 
-# Inicializar sesión
-if 'coord_coche' not in st.session_state: st.session_state.coord_coche = None
-if 'coord_muestra' not in st.session_state: st.session_state.coord_muestra = None
-if 'color_coche' not in st.session_state: st.session_state.color_coche = None
-if 'color_muestra' not in st.session_state: st.session_state.color_muestra = None
+# ─── HELPERS DE IMAGEN ───────────────────────────────────────────────────────
+def cargar_imagen(f):
+    f.seek(0)
+    return Image.open(f).convert("RGB")
 
-def load_image_safe(uploaded_file):
-    """Carga segura que rebobina el archivo para evitar errores"""
-    uploaded_file.seek(0)
-    return Image.open(uploaded_file).convert("RGB")
+def redimensionar(img, ancho=420):
+    r = ancho / img.size[0]
+    return img.resize((ancho, int(img.size[1] * r)), Image.Resampling.LANCZOS)
 
-def resize_image(image, width=400):
-    w_percent = (width / float(image.size[0]))
-    h_size = int((float(image.size[1]) * float(w_percent)))
-    return image.resize((width, h_size), Image.Resampling.LANCZOS)
+def dibujar_miras(img, puntos):
+    arr = np.array(img.copy())
+    for i, (x, y) in enumerate(puntos):
+        for color, grosor in [((0, 0, 0), 2), ((0, 255, 0), 1)]:
+            cv2.line(arr, (x - 15, y), (x + 15, y), color, grosor)
+            cv2.line(arr, (x, y - 15), (x, y + 15), color, grosor)
+            cv2.circle(arr, (x, y), 10, color, grosor)
+        cv2.putText(arr, str(i + 1), (x + 12, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3)
+        cv2.putText(arr, str(i + 1), (x + 12, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    return Image.fromarray(arr)
 
-def dibujar_mira_laser(image, x, y):
-    """Dibuja una mira de francotirador en el punto seleccionado"""
-    img_np = np.array(image)
-    
-    # 1. Cruz negra (fondo para contraste)
-    cv2.line(img_np, (x-15, y), (x+15, y), (0,0,0), 1)
-    cv2.line(img_np, (x, y-15), (x, y+15), (0,0,0), 1)
-    
-    # 2. Cruz verde neón (frente)
-    cv2.line(img_np, (x-15, y), (x+15, y), (0,255,0), 1)
-    cv2.line(img_np, (x, y-15), (x, y+15), (0,255,0), 1)
-    
-    # 3. Círculo
-    cv2.circle(img_np, (x, y), 10, (0, 255, 0), 1)
-    
-    return Image.fromarray(img_np)
+def muestrear_color(img, x, y, radio=4):
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    parche = arr[max(0, y - radio):min(h, y + radio + 1),
+                 max(0, x - radio):min(w, x + radio + 1)]
+    return tuple(parche.mean(axis=(0, 1)).astype(int))
 
-def rgb_to_lab(rgb):
-    norm = np.array([[[rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0]]], dtype=np.float32)
-    lab = cv2.cvtColor(norm, cv2.COLOR_RGB2Lab)
-    return lab[0][0][0], lab[0][0][1]-128, lab[0][0][2]-128
+def a_b64(img):
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.standard_b64encode(buf.getvalue()).decode()
 
-def generar_consejos(sistema, dL, da, db):
-    tintes = SISTEMAS[sistema]
+def hex_color(rgb):
+    return f"#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}"
+
+# ─── COLORIMETRÍA ─────────────────────────────────────────────────────────────
+def rgb_a_lab(rgb):
+    norm = np.array([[[rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0]]],
+                    dtype=np.float32)
+    L, a, b = cv2.cvtColor(norm, cv2.COLOR_RGB2Lab)[0][0]
+    return float(L), float(a - 128), float(b - 128)
+
+def lab_promedio(lista_rgb):
+    if not lista_rgb:
+        return None
+    return tuple(np.mean([rgb_a_lab(c) for c in lista_rgb], axis=0))
+
+def rgb_promedio(lista_rgb):
+    if not lista_rgb:
+        return None
+    return tuple(int(x) for x in np.mean(lista_rgb, axis=0))
+
+# ─── AJUSTE RÁPIDO (sin IA) ──────────────────────────────────────────────────
+def ajuste_rapido(sistema, dL, da, db):
+    t = SISTEMAS[sistema]
     consejos = []
-    if dL > 2.0: consejos.append(f"🌑 OSCURO: +{tintes['alu']}")
-    elif dL < -2.0: consejos.append(f"☀️ CLARO: +{tintes['negro']}")
-    if da > 1.5: consejos.append(f"🔥 Falta ROJO: +{tintes['rojo']}")
-    elif da < -1.5: consejos.append(f"🌿 Sobra ROJO: +Verde")
-    if db > 1.5: consejos.append(f"🌻 Falta AMARILLO: +{tintes['ocre']}")
-    elif db < -1.5: consejos.append(f"🌊 Sobra AMARILLO: +Azul")
-    if not consejos: return ["✅ ¡PERFECTO!"]
-    return consejos
+    if dL > 2:
+        consejos.append(f"Más oscuro → añadir **{t['negro']}**")
+    elif dL < -2:
+        consejos.append(f"Más claro → añadir **{t['aluminio']}** o **{t['blanco']}**")
+    if da > 1.5:
+        consejos.append(f"Más rojo → añadir **{t['rojo']}**")
+    elif da < -1.5:
+        consejos.append(f"Menos rojo → añadir **{t['verde']}**")
+    if db > 1.5:
+        consejos.append(f"Más amarillo → añadir **{t['ocre']}**")
+    elif db < -1.5:
+        consejos.append(f"Más azul → añadir **{t['azul']}**")
+    return consejos or ["✅ ¡Color en punto!"]
 
-# ==========================================
-# 4. INTERFAZ DIRECTA (V8 LAYOUT)
-# ==========================================
-st.title("Spectry Lab")
-marca = st.selectbox("Sistema", list(SISTEMAS.keys()), label_visibility="collapsed")
+# ─── AGENTE IA (streaming) ───────────────────────────────────────────────────
+def obtener_api_key():
+    return os.environ.get("ANTHROPIC_API_KEY") or st.session_state.get("api_key", "")
 
-# Función auxiliar para renderizar cada bloque con márgenes
-def bloque_imagen(titulo, key_suffix, session_coord, session_color):
+def stream_maestro_colorimetrista(b64_coche, b64_muestra, lab_c, lab_m, sistema, dE, pct):
+    dL = lab_c[0] - lab_m[0]
+    da = lab_c[1] - lab_m[1]
+    db = lab_c[2] - lab_m[2]
+    tintes = "; ".join(f"{k}: {v}" for k, v in SISTEMAS[sistema].items())
+
+    prompt = f"""Eres un maestro colorimetrista con 30 años de experiencia en pintura de automóviles.
+
+Se te presentan DOS imágenes:
+  • Imagen 1 — COLOR OBJETIVO: zona del coche que hay que igualar
+  • Imagen 2 — COLOR ACTUAL: la prueba de pintura mezclada en el taller
+
+═══ DATOS COLORIMÉTRICOS (espacio CIE L*a*b*) ═══
+  Objetivo (coche)  →  L* = {lab_c[0]:.2f}   a* = {lab_c[1]:+.2f}   b* = {lab_c[2]:+.2f}
+  Actual (prueba)   →  L* = {lab_m[0]:.2f}   a* = {lab_m[1]:+.2f}   b* = {lab_m[2]:+.2f}
+  Diferencia        →  ΔL = {dL:+.2f}   Δa* = {da:+.2f}   Δb* = {db:+.2f}
+  ΔE (CIELAB): {dE:.2f}   |   Similitud estimada: {pct:.1f}%
+
+Sistema de tintes activo: {sistema}
+Tintes disponibles: {tintes}
+
+REFERENCIA DE SIGNOS (muy importante para no confundir):
+  ΔL > 0  →  la prueba es más OSCURA que el objetivo  (hay que ACLARAR la prueba)
+  ΔL < 0  →  la prueba es más CLARA que el objetivo   (hay que OSCURECER la prueba)
+  Δa* > 0 →  la prueba tiene MENOS rojo               (hay que AÑADIR rojo)
+  Δa* < 0 →  la prueba tiene MÁS rojo                 (hay que QUITAR rojo / añadir verde)
+  Δb* > 0 →  la prueba tiene MENOS amarillo           (hay que AÑADIR amarillo/ocre)
+  Δb* < 0 →  la prueba tiene MÁS amarillo             (hay que AÑADIR azul)
+
+Responde con estas secciones:
+
+## 👁️ Diagnóstico Visual
+Describe brevemente las diferencias que observas entre las dos imágenes (tono, brillo, saturación, si hay efecto metálico o perlado).
+
+## 📊 Interpretación Colorimétrica
+Explica qué significa cada desviación ΔL, Δa*, Δb* para ESTE color concreto en términos prácticos.
+
+## 🧪 Receta de Ajuste
+Lista los tintes a modificar con cantidades específicas (gotas por 100 ml o % en peso). Ordena de mayor a menor impacto. Si ΔE > 10, indica que conviene reformular desde cero.
+
+## ⚠️ Advertencias
+Menciona posibles problemas: metamerismo, efecto flip/flop en metálicos, influencia del fondo de la chapa, condiciones de iluminación al fotografiar.
+
+## 💡 Truco de Maestro
+Un consejo práctico y específico para este caso concreto basado en tu experiencia.
+
+Sé conciso y habla directamente al pintor como lo haría un compañero experto."""
+
+    client = anthropic.Anthropic(api_key=obtener_api_key())
+    with client.messages.stream(
+        model="claude-opus-4-7",
+        max_tokens=1800,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": b64_coche}},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": b64_muestra}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    ) as stream:
+        yield from stream.text_stream
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERFAZ
+# ══════════════════════════════════════════════════════════════════════════════
+st.title("🧪 Spectry Lab")
+st.caption("Colorimetría inteligente para pintores de automóviles")
+
+# ── Barra lateral ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Configuración")
+
+    clave_input = st.text_input(
+        "🔑 Anthropic API Key", type="password",
+        value=st.session_state.get("api_key", ""),
+        help="Obtén tu clave en console.anthropic.com",
+    )
+    if clave_input:
+        st.session_state["api_key"] = clave_input
+
+    if obtener_api_key():
+        st.success("✓ API Key activa")
+    else:
+        st.warning("Sin API Key → análisis IA desactivado")
+
+    sistema = st.selectbox("🎨 Sistema de tintes", list(SISTEMAS.keys()))
+
+    st.divider()
+    st.markdown("""**Cómo usar:**
+1. Sube la foto del **coche**
+2. Haz clic en el color a igualar
+3. Sube tu **prueba de pintura**
+4. Haz clic en el color de la prueba
+5. Pulsa **Analizar con IA** para la receta
+
+> 💡 Varios clics = mayor precisión (se promedia el color)""")
+
+# ── Bloque de imagen reutilizable ─────────────────────────────────────────────
+def bloque_imagen(titulo, sfx, key_puntos, key_rgb, key_prev, key_b64):
     st.subheader(titulo)
-    uploaded = st.file_uploader(f"Subir {titulo}", key=f"up_{key_suffix}", label_visibility="collapsed")
-    
-    if uploaded:
-        # 1. Cargar y Redimensionar (Seguro)
-        img_raw = load_image_safe(uploaded)
-        img_raw = resize_image(img_raw, width=400)
-        
-        # 2. Si ya hay un clic guardado, dibujamos la mira ANTES de mostrarla
-        img_to_show = img_raw.copy()
-        current_coord = st.session_state[session_coord]
-        
-        if current_coord:
-            img_to_show = dibujar_mira_laser(img_to_show, current_coord['x'], current_coord['y'])
+    f = st.file_uploader(
+        "Foto", key=f"up_{sfx}",
+        type=["jpg", "jpeg", "png", "webp"],
+        label_visibility="collapsed",
+    )
+    if not f:
+        st.markdown(
+            '<p style="color:#444;text-align:center;padding:50px 0">📷 Sube una foto</p>',
+            unsafe_allow_html=True,
+        )
+        return
 
-        # 3. Mostrar imagen clickable
-        st.markdown('<p class="instruccion">👇 Toca el color (Usa los lados para bajar)</p>', unsafe_allow_html=True)
-        
-        # MÁRGENES DE SEGURIDAD PARA SCROLL
-        c_left, c_center, c_right = st.columns([1, 10, 1]) 
-        
-        with c_center:
-            # Componente de clic
-            new_val = streamlit_image_coordinates(img_to_show, key=f"click_{key_suffix}")
-            
-            # 4. Lógica de actualización instantánea
-            if new_val and new_val != current_coord:
-                st.session_state[session_coord] = new_val
-                # Guardamos el color
-                px = img_raw.getpixel((new_val['x'], new_val['y']))
-                st.session_state[session_color] = rgb_to_lab(px)
-                st.rerun() # Recarga inmediata para pintar la mira
+    img = redimensionar(cargar_imagen(f))
+    st.session_state[key_b64] = a_b64(img)
 
-# --- LAYOUT PRINCIPAL ---
+    vis = dibujar_miras(img, st.session_state[key_puntos])
+    st.markdown(
+        '<p class="hint">👇 Haz clic en el color (varios clics = mayor precisión)</p>',
+        unsafe_allow_html=True,
+    )
+    _, col_c, _ = st.columns([1, 10, 1])
+    with col_c:
+        coord = streamlit_image_coordinates(vis, key=f"cl_{sfx}")
+
+    if coord and coord != st.session_state[key_prev]:
+        st.session_state[key_prev] = coord
+        st.session_state[key_puntos].append((coord["x"], coord["y"]))
+        st.session_state[key_rgb].append(muestrear_color(img, coord["x"], coord["y"]))
+        st.rerun()
+
+    if st.session_state[key_rgb]:
+        c1, c2 = st.columns([6, 1])
+        with c1:
+            chips = "".join(
+                f'<span class="chip" style="background:{hex_color(c)}" title="Muestra {i+1}"></span>'
+                for i, c in enumerate(st.session_state[key_rgb])
+            )
+            lab = lab_promedio(st.session_state[key_rgb])
+            n = len(st.session_state[key_rgb])
+            st.markdown(
+                f"{chips}&nbsp;<small style='color:#666'>"
+                f"L*={lab[0]:.1f}  a*={lab[1]:+.1f}  b*={lab[2]:+.1f}"
+                f" — {n} muestra{'s' if n > 1 else ''}</small>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            if st.button("🗑️", key=f"del_{sfx}", help="Borrar todas las muestras"):
+                st.session_state[key_puntos] = []
+                st.session_state[key_rgb] = []
+                st.session_state[key_prev] = None
+                st.rerun()
+
+# ── Layout 2 columnas ─────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
-
 with col1:
-    bloque_imagen("🚗 Coche", "c", "coord_coche", "color_coche")
-
+    bloque_imagen("🚗 Color del Coche (objetivo)", "c",
+                  "puntos_coche", "rgb_coche", "prev_coche", "b64_coche")
 with col2:
-    bloque_imagen("🎨 Muestra", "m", "coord_muestra", "color_muestra")
+    bloque_imagen("🎨 Prueba del Taller (actual)", "m",
+                  "puntos_muestra", "rgb_muestra", "prev_muestra", "b64_muestra")
 
-# ==========================================
-# 5. RESULTADOS
-# ==========================================
-if st.session_state.color_coche and st.session_state.color_muestra:
-    Lc, ac, bc = st.session_state.color_coche
-    Lm, am, bm = st.session_state.color_muestra
-    dL, da, db = Lc-Lm, ac-am, bc-bm
-    dE = np.sqrt(dL**2 + da**2 + db**2)
-    
-    porcentaje = max(0, 100 - (dE * 2))
-    color_class = "rojo"
-    if porcentaje > 88: color_class = "amarillo"
-    if porcentaje > 95: color_class = "verde"
+# ── Resultados ────────────────────────────────────────────────────────────────
+lab_c = lab_promedio(st.session_state["rgb_coche"])
+lab_m = lab_promedio(st.session_state["rgb_muestra"])
 
-    st.markdown("---")
-    
-    # CAJA VISUAL DE RESULTADO
+if lab_c and lab_m:
+    dL = lab_c[0] - lab_m[0]
+    da = lab_c[1] - lab_m[1]
+    db = lab_c[2] - lab_m[2]
+    dE = float(np.sqrt(dL**2 + da**2 + db**2))
+    pct = max(0.0, 100.0 - dE * 2)
+
+    clase = "rojo"
+    if pct > 88:
+        clase = "amarillo"
+    if pct > 95:
+        clase = "verde"
+
+    st.divider()
+
+    # Swatches de comparación visual
+    avg_rgb_c = rgb_promedio(st.session_state["rgb_coche"])
+    avg_rgb_m = rgb_promedio(st.session_state["rgb_muestra"])
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown(
+            f'<div class="swatch" style="background:{hex_color(avg_rgb_c)}"></div>'
+            f'<p style="color:#666;font-size:.8rem;text-align:center;margin-top:4px">Objetivo (coche)</p>',
+            unsafe_allow_html=True,
+        )
+    with sc2:
+        st.markdown(
+            f'<div class="swatch" style="background:{hex_color(avg_rgb_m)}"></div>'
+            f'<p style="color:#666;font-size:.8rem;text-align:center;margin-top:4px">Actual (prueba)</p>',
+            unsafe_allow_html=True,
+        )
+
+    # Caja de similitud
     st.markdown(f"""
-    <div class="resultado-final">
-        <div style="color:#888; letter-spacing: 2px; margin-bottom:5px;">COINCIDENCIA</div>
-        <div class="similitud-valor {color_class}">{porcentaje:.1f}%</div>
-        <div style="margin-top:10px; font-size:1.2rem; color:#FFF;">
-            L: <b>{dL:.1f}</b> &nbsp;|&nbsp; a: <b>{da:.1f}</b> &nbsp;|&nbsp; b: <b>{db:.1f}</b>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # RECETA DE AJUSTE
-    consejos = generar_consejos(marca, dL, da, db)
-    st.markdown(f"### 🛠️ {' | '.join(consejos)}")
+<div class="resultado-box">
+  <div style="color:#555;letter-spacing:2px;font-size:.8rem">SIMILITUD CROMÁTICA</div>
+  <div class="dE-val {clase}">{pct:.1f}%</div>
+  <div style="color:#777;font-size:.82rem;margin-top:6px">
+    ΔE = {dE:.2f} &nbsp;·&nbsp;
+    ΔL = {dL:+.2f} &nbsp;·&nbsp;
+    Δa* = {da:+.2f} &nbsp;·&nbsp;
+    Δb* = {db:+.2f}
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-elif st.session_state.coord_coche or st.session_state.coord_muestra:
-    st.info("👆 Te falta seleccionar el otro color para calcular.")
+    # Ajuste rápido sin IA
+    ajustes = ajuste_rapido(sistema, dL, da, db)
+    if ajustes[0].startswith("✅"):
+        st.success(ajustes[0])
+    else:
+        with st.expander("🛠️ Ajuste rápido (sin IA)", expanded=True):
+            for a in ajustes:
+                st.write(f"• {a}")
+
+    # Análisis IA
+    st.markdown("### 🤖 Análisis del Maestro Colorimetrista")
+
+    tiene_fotos = bool(st.session_state["b64_coche"] and st.session_state["b64_muestra"])
+    tiene_key = bool(obtener_api_key())
+
+    if not tiene_fotos:
+        st.info("Se necesitan las fotos de ambos lados para el análisis con IA.")
+    elif not tiene_key:
+        st.warning("Configura la API Key de Anthropic en la barra lateral para activar el análisis.")
+    else:
+        if st.button("🔬 Obtener Receta del Maestro Colorimetrista",
+                     type="primary", use_container_width=True):
+            st.session_state["resultado_ia"] = None
+            try:
+                texto_completo = st.write_stream(stream_maestro_colorimetrista(
+                    st.session_state["b64_coche"],
+                    st.session_state["b64_muestra"],
+                    lab_c, lab_m, sistema, dE, pct,
+                ))
+                st.session_state["resultado_ia"] = texto_completo
+            except anthropic.AuthenticationError:
+                st.error("❌ API Key inválida. Comprueba la configuración en la barra lateral.")
+            except Exception as e:
+                st.error(f"❌ Error al consultar la IA: {e}")
+        elif st.session_state["resultado_ia"]:
+            st.markdown(st.session_state["resultado_ia"])
+
+elif st.session_state["rgb_coche"] or st.session_state["rgb_muestra"]:
+    st.info("👆 Selecciona el color en la otra foto para calcular la diferencia.")
