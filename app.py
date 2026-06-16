@@ -1,40 +1,103 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from streamlit_image_coordinates import streamlit_image_coordinates
 import anthropic
 import base64
+import hashlib
 import io
 import os
 
 # ─── CONFIGURACIÓN ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Spectry Lab", layout="wide", page_icon="🧪")
 
+# El esquema de color base (fondo claro, tarjetas blancas, texto oscuro) se
+# define en .streamlit/config.toml para que todos los widgets nativos de
+# Streamlit (botones, sliders, alerts...) hereden el tema automáticamente.
+# Aquí solo se añaden los componentes decorativos que Streamlit no ofrece.
 st.markdown("""
 <style>
-  .main { overflow-y: scroll !important; }
-  html, body, [class*="css"] { font-size: 14px; background-color: #0E1117; color: #E6E6E6; }
-  .block-container { padding-top: 1rem; padding-bottom: 3rem; }
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+  .block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1180px; }
 
-  .resultado-box {
-    background: #111; border: 2px solid #333; border-radius: 12px;
-    padding: 20px; text-align: center; margin: 10px 0;
+  div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 16px !important;
+    box-shadow: 0 1px 3px rgba(16,24,40,0.06), 0 1px 2px rgba(16,24,40,0.04);
   }
-  .dE-val { font-size: 3.5rem; font-weight: 900; margin: 4px 0; line-height: 1; }
-  .verde    { color: #00FF00; }
-  .amarillo { color: #FFD700; }
-  .rojo     { color: #FF4444; }
+
+  .stButton > button[kind="primary"] {
+    background: linear-gradient(90deg,#0EA5E9,#6366F1);
+    border: none;
+  }
+
+  /* Tarjeta de resultado autocontenida */
+  .card {
+    background: #FFFFFF; border: 1px solid #E4E7EC; border-radius: 16px;
+    padding: 24px; box-shadow: 0 1px 3px rgba(16,24,40,0.06), 0 1px 2px rgba(16,24,40,0.04);
+    margin: 12px 0;
+  }
+
+  /* Cabecera de pasos */
+  .steps-row { display:flex; justify-content:center; gap:10px; margin: 4px 0 22px 0; flex-wrap: wrap; }
+  .step-pill {
+    display:flex; align-items:center; gap:8px; background:#fff; border:1px solid #E4E7EC;
+    border-radius:999px; padding:7px 16px; font-size:.82rem; font-weight:600; color:#8A94A6;
+  }
+  .step-pill.active { border-color:#0EA5E9; color:#0EA5E9; background:#EFF8FF; }
+  .step-pill.done   { border-color:#16A34A; color:#16A34A; background:#F0FDF4; }
+  .step-num {
+    width:20px; height:20px; border-radius:50%; background:#D0D5DD; color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:.7rem; flex-shrink:0;
+  }
+  .step-pill.active .step-num { background:#0EA5E9; }
+  .step-pill.done .step-num   { background:#16A34A; }
+
+  /* Gauge circular de similitud */
+  .gauge-wrap { display:flex; justify-content:center; padding: 4px 0; }
+  .gauge {
+    width:168px; height:168px; border-radius:50%;
+    background: conic-gradient(var(--gauge-color) calc(var(--gauge-deg) * 1deg), #E4E7EC 0deg);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .gauge-inner {
+    width:134px; height:134px; border-radius:50%; background:#fff;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    box-shadow: inset 0 0 0 1px #E4E7EC;
+  }
+  .gauge-pct   { font-size:2.1rem; font-weight:800; color:#101828; line-height:1; }
+  .gauge-label { font-size:.68rem; color:#8A94A6; letter-spacing:1.5px; margin-top:3px; }
+
+  /* Comparación VS de muestras */
+  .vs-row { display:flex; align-items:center; gap:18px; justify-content:center; }
+  .vs-swatch-box { text-align:center; }
+  .vs-swatch {
+    width:84px; height:84px; border-radius:12px; border:1px solid #E4E7EC;
+    box-shadow:0 1px 2px rgba(16,24,40,.08);
+  }
+  .vs-label { font-size:.72rem; color:#344054; font-weight:600; margin-top:6px; }
+  .vs-hex   { font-size:.72rem; color:#8A94A6; font-family: monospace; }
+  .vs-versus { font-size:1.05rem; font-weight:800; color:#D0D5DD; }
+
+  /* Insignias de calidad */
+  .badge {
+    display:inline-flex; align-items:center; gap:4px; padding:3px 11px;
+    border-radius:999px; font-size:.74rem; font-weight:600; margin: 2px 0;
+  }
+  .badge-ok  { background:#F0FDF4; color:#16A34A; }
+  .badge-mid { background:#FFFBEB; color:#D97706; }
+  .badge-bad { background:#FEF2F2; color:#DC2626; }
+
+  .dE-ok  { color:#16A34A; }
+  .dE-mid { color:#D97706; }
+  .dE-bad { color:#DC2626; }
 
   .chip {
-    display: inline-block; width: 26px; height: 26px;
-    border-radius: 4px; border: 1px solid #444; margin: 2px; vertical-align: middle;
+    display:inline-block; width:22px; height:22px; border-radius:6px;
+    border:1px solid #E4E7EC; margin:2px; vertical-align:middle;
   }
-  .swatch { width: 100%; height: 70px; border-radius: 8px; border: 1px solid #333; }
-  .hint { color: #666; font-size: .78rem; text-align: center; margin-bottom: 3px; }
-  .q-ok  { color: #00cc44; font-size: .75rem; }
-  .q-mid { color: #FFD700; font-size: .75rem; }
-  .q-bad { color: #FF4444; font-size: .75rem; }
+  .hint { color:#8A94A6; font-size:.8rem; text-align:center; margin-bottom:4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -61,29 +124,43 @@ SISTEMAS = {
 }
 
 # ─── ESTADO DE SESIÓN ─────────────────────────────────────────────────────────
-for k, v in {
+ESTADO_POR_DEFECTO = {
     "puntos_coche": [], "puntos_muestra": [],
     "rgb_coche": [],    "rgb_muestra": [],
     "std_coche": [],    "std_muestra": [],
     "prev_coche": None, "prev_muestra": None,
+    "hash_coche": None, "hash_muestra": None,
+    "imgfull_coche": None, "imgfull_muestra": None,
     "b64_coche": None,  "b64_muestra": None,
-    "file_coche": None, "file_muestra": None,
+    "factor_coche": None, "factor_muestra": None,
+    "calidad_coche": None, "calidad_muestra": None,
+    "ilu_coche": None, "ilu_muestra": None,
     "resultado_ia": None,
-}.items():
+}
+for k, v in ESTADO_POR_DEFECTO.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ─── HELPERS DE IMAGEN ───────────────────────────────────────────────────────
 def cargar_imagen(f):
     f.seek(0)
-    return Image.open(f).convert("RGB")
+    img = Image.open(f)
+    img = ImageOps.exif_transpose(img)  # corrige fotos de móvil giradas por el sensor de orientación
+    return img.convert("RGB")
 
-def redimensionar(img, ancho=420):
-    # FIX: no forzar upscale si la imagen es más pequeña
-    if img.size[0] <= ancho:
+def hash_archivo(f):
+    f.seek(0)
+    h = hashlib.md5(f.read()).hexdigest()
+    f.seek(0)
+    return h
+
+def redimensionar(img, lado_max):
+    w, h = img.size
+    lado = max(w, h)
+    if lado <= lado_max:
         return img.copy()
-    r = ancho / img.size[0]
-    return img.resize((ancho, int(img.size[1] * r)), Image.Resampling.LANCZOS)
+    r = lado_max / lado
+    return img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.Resampling.LANCZOS)
 
 def dibujar_miras(img, puntos):
     arr = np.array(img.copy())
@@ -103,13 +180,15 @@ def muestrear_color(img, x, y, radio):
     h, w = arr.shape[:2]
     parche = arr[max(0, y - radio):min(h, y + radio + 1),
                  max(0, x - radio):min(w, x + radio + 1)]
-    pixeles = parche.reshape(-1, 3)
-    # FIX: mediana (más robusta a reflejos que la media) + redondeo correcto
+    pixeles = parche.reshape(-1, 3).astype(np.float32)
     rgb = tuple(np.median(pixeles, axis=0).round().astype(int))
-    std = float(pixeles.std())
+    # Desviación por canal (no agrupada): un color saturado uniforme (R≠G≠B)
+    # no debe contar como "ruido" — solo la variación espacial dentro de cada
+    # canal indica falta de uniformidad real (reflejos, textura, sombra).
+    std = float(np.mean(np.std(pixeles, axis=0)))
     return rgb, std
 
-def zoom_punto(img, x, y, radio_zoom=50, tam=180):
+def zoom_punto(img, x, y, radio_zoom=70, tam=220):
     arr = np.array(img)
     h, w = arr.shape[:2]
     y1, y2 = max(0, y - radio_zoom), min(h, y + radio_zoom)
@@ -124,6 +203,60 @@ def a_b64(img):
 
 def hex_color(rgb):
     return f"#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}"
+
+# ─── CALIDAD DE CAPTURA ───────────────────────────────────────────────────────
+def analizar_calidad_captura(img):
+    """Detecta automáticamente desenfoque y sobre/sub-exposición de la foto recién subida."""
+    arr = np.array(img)
+    gris = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    nitidez = float(cv2.Laplacian(gris, cv2.CV_64F).var())
+    sobreexp = float(np.mean(np.all(arr >= 248, axis=2))) * 100
+    subexp = float(np.mean(np.all(arr <= 10, axis=2))) * 100
+
+    avisos = []
+    if nitidez < 60:
+        avisos.append(("bad", f"Imagen borrosa (nitidez {nitidez:.0f}) — apoya el móvil y espera a que enfoque antes de disparar"))
+    elif nitidez < 120:
+        avisos.append(("mid", f"Nitidez algo baja ({nitidez:.0f}) — si puedes, repite la foto"))
+    if sobreexp > 3:
+        avisos.append(("bad", f"Zonas quemadas ({sobreexp:.1f}%) — evita el flash y el sol directo sobre la pintura"))
+    if subexp > 15:
+        avisos.append(("mid", f"Zonas muy oscuras ({subexp:.1f}%) — busca un punto con más luz"))
+    return {"nitidez": nitidez, "sobreexp": sobreexp, "subexp": subexp, "avisos": avisos}
+
+# ─── ILUMINANTE Y CALIBRACIÓN SIN HARDWARE ESPECÍFICO ────────────────────────
+def estimar_iluminante(img):
+    """Estimación tipo 'white-patch': promedia el 10% de píxeles más brillantes
+    y no quemados como proxy del color de la luz de la escena. Es más fiable que
+    un gray-world clásico cuando el objeto fotografiado es un único color saturado
+    (el gray-world trataría ese tono como un error a corregir)."""
+    arr = np.array(img).reshape(-1, 3).astype(np.float32)
+    brillo = arr.sum(axis=1)
+    no_quemado = np.all(arr < 250, axis=1)
+    base = arr[no_quemado] if no_quemado.any() else arr
+    brillo_base = brillo[no_quemado] if no_quemado.any() else brillo
+    umbral = np.percentile(brillo_base, 90)
+    seleccion = base[brillo_base >= umbral]
+    if len(seleccion) == 0:
+        seleccion = base
+    return seleccion.mean(axis=0)
+
+def diferencia_iluminantes(ilu_a, ilu_b):
+    va = ilu_a / (np.linalg.norm(ilu_a) + 1e-6)
+    vb = ilu_b / (np.linalg.norm(ilu_b) + 1e-6)
+    return float(np.linalg.norm(va - vb))
+
+def calcular_factor_calibracion(rgb_medido, objetivo=200.0):
+    """Factor por canal para que un punto neutro (gris/blanco) tocado por el
+    usuario quede en gris real. No requiere ninguna carta de color: sirve
+    cualquier papel, pared o trapo neutro presente en la propia foto."""
+    factor = np.array([objetivo / max(float(c), 1.0) for c in rgb_medido], dtype=np.float32)
+    return np.clip(factor, 0.6, 1.8)
+
+def aplicar_calibracion(rgb, factor):
+    if factor is None:
+        return tuple(int(c) for c in rgb)
+    return tuple(int(round(min(255, max(0, c * f)))) for c, f in zip(rgb, factor))
 
 # ─── COLORIMETRÍA ─────────────────────────────────────────────────────────────
 def rgb_a_lab(rgb):
@@ -145,17 +278,22 @@ def rgb_promedio(lista_rgb):
 
 def interpretar_dE(dE):
     if dE < 1.0:
-        return "Diferencia imperceptible al ojo humano", "verde"
+        return "Diferencia imperceptible al ojo humano", "ok"
     elif dE < 2.0:
-        return "Solo detectable por expertos entrenados", "verde"
+        return "Solo detectable por expertos entrenados", "ok"
     elif dE < 3.5:
-        return "Perceptible — umbral de aceptación industrial", "amarillo"
+        return "Perceptible — umbral de aceptación industrial", "mid"
     elif dE < 5.0:
-        return "Diferencia clara — ajuste necesario", "amarillo"
+        return "Diferencia clara — ajuste necesario", "mid"
     elif dE < 10.0:
-        return "Diferencia notable — ajuste importante", "rojo"
+        return "Diferencia notable — ajuste importante", "bad"
     else:
-        return "Colores muy distintos — valorar reformular", "rojo"
+        return "Colores muy distintos — valorar reformular", "bad"
+
+def lista_calibrada(sfx):
+    factor = st.session_state.get(f"factor_{sfx}")
+    crudos = st.session_state.get(f"rgb_{sfx}", [])
+    return [aplicar_calibracion(c, factor) for c in crudos]
 
 # ─── AJUSTE RÁPIDO (sin IA) ──────────────────────────────────────────────────
 def ajuste_rapido(sistema, dL, da, db):
@@ -172,7 +310,6 @@ def ajuste_rapido(sistema, dL, da, db):
     """
     t = SISTEMAS[sistema]
     r = []
-    # FIX CRÍTICO: los signos estaban invertidos en la versión anterior
     if dL > 2:
         r.append(f"Prueba demasiado **oscura** (ΔL={dL:+.1f}) → aclarar con **{t['aluminio']}** o **{t['blanco']}**")
     elif dL < -2:
@@ -192,14 +329,16 @@ def obtener_api_key():
     return os.environ.get("ANTHROPIC_API_KEY") or st.session_state.get("api_key", "")
 
 def stream_maestro(b64_c, b64_m, lab_c, lab_m, sistema, dE, pct,
-                   n_c, n_m, std_c, std_m, radio):
+                   n_c, n_m, std_c, std_m, radio, cal_c, cal_m):
     dL = lab_c[0] - lab_m[0]
     da = lab_c[1] - lab_m[1]
     db = lab_c[2] - lab_m[2]
     tintes = "; ".join(f"{k}: {v}" for k, v in SISTEMAS[sistema].items())
 
-    cal_c = "buena" if (std_c < 15) else ("aceptable" if std_c < 30 else "alta variación (posible reflejo)")
-    cal_m = "buena" if (std_m < 15) else ("aceptable" if std_m < 30 else "alta variación (posible reflejo)")
+    calidad_c = "buena" if (std_c < 15) else ("aceptable" if std_c < 30 else "alta variación (posible reflejo)")
+    calidad_m = "buena" if (std_m < 15) else ("aceptable" if std_m < 30 else "alta variación (posible reflejo)")
+    cal_c_txt = "sí, corregido por el usuario" if cal_c else "no"
+    cal_m_txt = "sí, corregido por el usuario" if cal_m else "no"
 
     prompt = f"""Eres un maestro colorimetrista con 30 años de experiencia en pintura de automóviles.
 
@@ -213,8 +352,9 @@ Se te presentan DOS imágenes:
   Diferencia        →  ΔL = {dL:+.2f}   Δa* = {da:+.2f}   Δb* = {db:+.2f}
   ΔE (CIE76): {dE:.2f}   |   Similitud estimada: {pct:.1f}%
 
-Calidad de muestras: coche={cal_c} ({n_c} punto/s), prueba={cal_m} ({n_m} punto/s)
-Radio de muestreo usado: {radio}px por punto
+Calidad de muestras: coche={calidad_c} ({n_c} punto/s), prueba={calidad_m} ({n_m} punto/s)
+Balance de blancos calibrado manualmente por el usuario: coche={cal_c_txt}, prueba={cal_m_txt}
+Radio de muestreo usado: {radio}px por punto (sobre la foto en alta resolución)
 Sistema de tintes: {sistema}
 Tintes disponibles: {tintes}
 
@@ -265,8 +405,6 @@ Sé conciso y directo. Habla como un experto a su compañero pintor."""
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERFAZ
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("🧪 Spectry Lab")
-st.caption("Colorimetría inteligente para pintores de automóviles")
 
 # ── Barra lateral ─────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -288,8 +426,8 @@ with st.sidebar:
     sistema = st.selectbox("🎨 Sistema de tintes", list(SISTEMAS.keys()))
 
     radio_muestra = st.slider(
-        "📏 Radio de muestra (px)", min_value=2, max_value=25, value=6,
-        help="Área de píxeles analizada alrededor del clic. Mayor radio = más promedio, mejor para colores uniformes.",
+        "📏 Radio de muestra (px)", min_value=5, max_value=80, value=25,
+        help="Área de píxeles analizada alrededor del clic, medida sobre la foto en alta resolución. Mayor radio = más promedio, mejor para colores uniformes.",
     )
 
     st.divider()
@@ -302,9 +440,11 @@ with st.sidebar:
 2. **Sin reflejo especular** — mueve la cámara hasta que no veas brillo en la zona.
 3. **Perpendicular a la superficie** — fotografía recto, no en ángulo.
 4. **Zona plana del coche** — evita curvas y esquinas donde cambia el ángulo de luz.
-5. **Prueba sobre cartón gris neutro** — no uses fondo blanco ni negro.
+5. **Prueba sobre cartón o papel gris/blanco neutro** — no uses fondo de color.
 6. **Desactiva HDR y Live Photo** — pueden alterar los colores reales.
 7. **Mismo momento del día** — la temperatura de color de la luz solar varía mucho.
+8. **Sube la foto desde la cámara nativa del móvil** — al tocar "Subir foto" en un teléfono se abre la cámara del sistema, con mejor control de exposición y enfoque que una cámara web del navegador.
+9. **¿Luz distinta entre las dos fotos?** — activa "Calibrar con punto neutro" y toca un papel, pared o trapo neutro presente en la propia foto. No hace falta ninguna carta de color.
         """)
 
     st.divider()
@@ -316,121 +456,182 @@ with st.sidebar:
 5. Pulsa **Analizar con IA** para la receta
 > 💡 Varios clics = más precisión (se promedia)""")
 
+# ── Cabecera ──────────────────────────────────────────────────────────────────
+st.title("🧪 Spectry Lab")
+st.caption("Colorimetría inteligente para pintores de automóviles")
+
+paso1_ok = bool(st.session_state["rgb_coche"])
+paso2_ok = bool(st.session_state["rgb_muestra"])
+paso3_ok = paso1_ok and paso2_ok
+
+st.markdown(f"""
+<div class="steps-row">
+  <div class="step-pill {'done' if paso1_ok else 'active'}"><span class="step-num">1</span> Coche</div>
+  <div class="step-pill {'done' if paso2_ok else ('active' if paso1_ok else '')}"><span class="step-num">2</span> Prueba</div>
+  <div class="step-pill {'active' if paso3_ok else ''}"><span class="step-num">3</span> Resultado</div>
+</div>
+""", unsafe_allow_html=True)
+
 # ── Bloque de imagen ──────────────────────────────────────────────────────────
-def bloque_imagen(titulo, sfx, key_pts, key_rgb, key_std, key_prev, key_b64, key_file):
-    st.subheader(titulo)
-    f = st.file_uploader(
-        "Foto", key=f"up_{sfx}",
-        type=["jpg", "jpeg", "png", "webp"],
-        label_visibility="collapsed",
-    )
-    if not f:
+def bloque_imagen(titulo, sfx):
+    key_pts     = f"puntos_{sfx}"
+    key_rgb     = f"rgb_{sfx}"
+    key_std     = f"std_{sfx}"
+    key_prev    = f"prev_{sfx}"
+    key_hash    = f"hash_{sfx}"
+    key_imgfull = f"imgfull_{sfx}"
+    key_b64     = f"b64_{sfx}"
+    key_factor  = f"factor_{sfx}"
+    key_calidad = f"calidad_{sfx}"
+    key_ilu     = f"ilu_{sfx}"
+
+    with st.container(border=True):
+        st.markdown(f"##### {titulo}")
+        f = st.file_uploader(
+            "Foto", key=f"up_{sfx}",
+            type=["jpg", "jpeg", "png", "webp"],
+            label_visibility="collapsed",
+        )
+        if not f:
+            st.markdown(
+                '<p style="color:#B0B7C3;text-align:center;padding:50px 0">📷 Sube una foto</p>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        nuevo_hash = hash_archivo(f)
+        if nuevo_hash != st.session_state.get(key_hash):
+            img_full = redimensionar(cargar_imagen(f), 2000)
+            st.session_state[key_imgfull] = img_full
+            st.session_state[key_hash]    = nuevo_hash
+            st.session_state[key_pts]     = []
+            st.session_state[key_rgb]     = []
+            st.session_state[key_std]     = []
+            st.session_state[key_prev]    = None
+            st.session_state[key_factor]  = None
+            st.session_state[key_calidad] = analizar_calidad_captura(img_full)
+            st.session_state[key_ilu]     = estimar_iluminante(img_full)
+            st.session_state[key_b64]     = a_b64(redimensionar(img_full, 900))
+            st.session_state["resultado_ia"] = None
+
+        img_full = st.session_state[key_imgfull]
+
+        for nivel, msg in st.session_state[key_calidad]["avisos"]:
+            if nivel == "bad":
+                st.warning(msg, icon="⚠️")
+            else:
+                st.info(msg, icon="💡")
+
+        img_click = redimensionar(img_full, 440)
+        escala = img_full.width / img_click.width
+
+        modo_cal = st.checkbox(
+            "🎯 Calibrar con punto neutro (gris/blanco presente en la foto)",
+            key=f"modocal_{sfx}",
+            help="Activa esto y toca un objeto gris o blanco neutro de la propia escena (papel, pared, trapo) para corregir el tono de la luz. No hace falta ninguna carta de color.",
+        )
+
+        vis = dibujar_miras(img_click, st.session_state[key_pts])
         st.markdown(
-            '<p style="color:#444;text-align:center;padding:50px 0">📷 Sube una foto</p>',
+            f'<p class="hint">👇 {"Toca el punto neutro de referencia" if modo_cal else "Haz clic en el color (varios clics = más precisión)"}</p>',
             unsafe_allow_html=True,
         )
-        return
+        _, col_c, _ = st.columns([1, 10, 1])
+        with col_c:
+            coord = streamlit_image_coordinates(vis, key=f"cl_{sfx}")
 
-    # FIX: detectar cambio de imagen y limpiar muestras antiguas
-    if f.name != st.session_state.get(key_file):
-        st.session_state[key_pts]  = []
-        st.session_state[key_rgb]  = []
-        st.session_state[key_std]  = []
-        st.session_state[key_prev] = None
-        st.session_state[key_file] = f.name
-        st.session_state["resultado_ia"] = None  # invalidar análisis anterior
+        if coord and coord != st.session_state[key_prev]:
+            st.session_state[key_prev] = coord
+            x_full = min(img_full.width - 1, int(round(coord["x"] * escala)))
+            y_full = min(img_full.height - 1, int(round(coord["y"] * escala)))
 
-    img = redimensionar(cargar_imagen(f))
-    st.session_state[key_b64] = a_b64(img)
+            if modo_cal:
+                rgb_neutro, _ = muestrear_color(img_full, x_full, y_full, radio_muestra)
+                st.session_state[key_factor] = calcular_factor_calibracion(rgb_neutro)
+                st.session_state["resultado_ia"] = None
+                st.rerun()
+            else:
+                st.session_state[key_pts].append((coord["x"], coord["y"]))
+                rgb, std = muestrear_color(img_full, x_full, y_full, radio_muestra)
+                st.session_state[key_rgb].append(rgb)
+                st.session_state[key_std].append(std)
+                st.session_state["resultado_ia"] = None
+                st.rerun()
 
-    vis = dibujar_miras(img, st.session_state[key_pts])
-    st.markdown(
-        '<p class="hint">👇 Haz clic en el color (múltiples clics = mayor precisión)</p>',
-        unsafe_allow_html=True,
-    )
-    _, col_c, _ = st.columns([1, 10, 1])
-    with col_c:
-        coord = streamlit_image_coordinates(vis, key=f"cl_{sfx}")
+        if st.session_state[key_factor] is not None:
+            fb1, fb2 = st.columns([3, 1])
+            with fb1:
+                st.markdown('<span class="badge badge-ok">✓ Calibrado con punto neutro</span>', unsafe_allow_html=True)
+            with fb2:
+                if st.button("Quitar", key=f"quitarcal_{sfx}"):
+                    st.session_state[key_factor] = None
+                    st.session_state["resultado_ia"] = None
+                    st.rerun()
 
-    if coord and coord != st.session_state[key_prev]:
-        st.session_state[key_prev] = coord
-        st.session_state[key_pts].append((coord["x"], coord["y"]))
-        rgb, std = muestrear_color(img, coord["x"], coord["y"], radio_muestra)
-        st.session_state[key_rgb].append(rgb)
-        st.session_state[key_std].append(std)
-        # FIX: invalidar análisis al añadir nueva muestra
-        st.session_state["resultado_ia"] = None
-        st.rerun()
+        if not st.session_state[key_rgb]:
+            return
 
-    if not st.session_state[key_rgb]:
-        return
+        rgb_calibrado = [aplicar_calibracion(c, st.session_state[key_factor]) for c in st.session_state[key_rgb]]
 
-    # Chips de color + valores LAB medios
-    chips = "".join(
-        f'<span class="chip" style="background:{hex_color(c)}" title="Muestra {i+1}"></span>'
-        for i, c in enumerate(st.session_state[key_rgb])
-    )
-    lab = lab_promedio(st.session_state[key_rgb])
-    n = len(st.session_state[key_rgb])
-    st.markdown(
-        f"{chips}&nbsp;<small style='color:#666'>"
-        f"L*={lab[0]:.1f}  a*={lab[1]:+.1f}  b*={lab[2]:+.1f}"
-        f" — {n} muestra{'s' if n > 1 else ''}</small>",
-        unsafe_allow_html=True,
-    )
+        chips = "".join(
+            f'<span class="chip" style="background:{hex_color(c)}" title="Muestra {i+1}"></span>'
+            for i, c in enumerate(rgb_calibrado)
+        )
+        lab = lab_promedio(rgb_calibrado)
+        n = len(rgb_calibrado)
+        st.markdown(
+            f"{chips}&nbsp;<small style='color:#8A94A6'>"
+            f"L*={lab[0]:.1f}  a*={lab[1]:+.1f}  b*={lab[2]:+.1f}"
+            f" — {n} muestra{'s' if n > 1 else ''}</small>",
+            unsafe_allow_html=True,
+        )
 
-    # Indicador de calidad de la muestra
-    std_prom = float(np.mean(st.session_state[key_std]))
-    if std_prom < 15:
-        st.markdown(f'<p class="q-ok">✓ Muestra uniforme (variación {std_prom:.0f})</p>',
-                    unsafe_allow_html=True)
-    elif std_prom < 30:
-        st.markdown(f'<p class="q-mid">⚠ Variación moderada ({std_prom:.0f}) — puede haber reflejo o textura</p>',
-                    unsafe_allow_html=True)
-    else:
-        st.markdown(f'<p class="q-bad">✗ Alta variación ({std_prom:.0f}) — elige una zona más uniforme y sin brillo</p>',
-                    unsafe_allow_html=True)
+        std_prom = float(np.mean(st.session_state[key_std]))
+        if std_prom < 15:
+            st.markdown(f'<span class="badge badge-ok">✓ Muestra uniforme ({std_prom:.0f})</span>', unsafe_allow_html=True)
+        elif std_prom < 30:
+            st.markdown(f'<span class="badge badge-mid">⚠ Variación moderada ({std_prom:.0f})</span>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<span class="badge badge-bad">✗ Alta variación ({std_prom:.0f}) — busca una zona más uniforme</span>', unsafe_allow_html=True)
 
-    # Zoom del último punto seleccionado
-    lx, ly = st.session_state[key_pts][-1]
-    with st.expander("🔍 Zoom del último punto"):
-        zoom = zoom_punto(img, lx, ly)
-        st.image(zoom, caption=f"Área ampliada (radio {radio_muestra}px)")
+        lx, ly = st.session_state[key_pts][-1]
+        x_full = min(img_full.width - 1, int(round(lx * escala)))
+        y_full = min(img_full.height - 1, int(round(ly * escala)))
+        with st.expander("🔍 Zoom del último punto"):
+            zoom = zoom_punto(img_full, x_full, y_full)
+            st.image(zoom, caption=f"Área ampliada (radio {radio_muestra}px sobre la foto original)")
 
-    # Botones de gestión
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("↩️ Borrar último", key=f"undo_{sfx}",
-                     disabled=len(st.session_state[key_pts]) == 0):
-            st.session_state[key_pts].pop()
-            st.session_state[key_rgb].pop()
-            st.session_state[key_std].pop()
-            st.session_state[key_prev] = None
-            st.session_state["resultado_ia"] = None
-            st.rerun()
-    with b2:
-        if st.button("🗑️ Borrar todos", key=f"del_{sfx}"):
-            st.session_state[key_pts]  = []
-            st.session_state[key_rgb]  = []
-            st.session_state[key_std]  = []
-            st.session_state[key_prev] = None
-            st.session_state["resultado_ia"] = None
-            st.rerun()
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("↩️ Borrar último", key=f"undo_{sfx}",
+                         disabled=len(st.session_state[key_pts]) == 0):
+                st.session_state[key_pts].pop()
+                st.session_state[key_rgb].pop()
+                st.session_state[key_std].pop()
+                st.session_state[key_prev] = None
+                st.session_state["resultado_ia"] = None
+                st.rerun()
+        with b2:
+            if st.button("🗑️ Borrar todos", key=f"del_{sfx}"):
+                st.session_state[key_pts]  = []
+                st.session_state[key_rgb]  = []
+                st.session_state[key_std]  = []
+                st.session_state[key_prev] = None
+                st.session_state["resultado_ia"] = None
+                st.rerun()
 
 # ── Layout 2 columnas ─────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
 with col1:
-    bloque_imagen("🚗 Color del Coche (objetivo)", "c",
-                  "puntos_coche", "rgb_coche", "std_coche",
-                  "prev_coche", "b64_coche", "file_coche")
+    bloque_imagen("🚗 Color del Coche (objetivo)", "coche")
 with col2:
-    bloque_imagen("🎨 Prueba del Taller (actual)", "m",
-                  "puntos_muestra", "rgb_muestra", "std_muestra",
-                  "prev_muestra", "b64_muestra", "file_muestra")
+    bloque_imagen("🎨 Prueba del Taller (actual)", "muestra")
 
 # ── Resultados ────────────────────────────────────────────────────────────────
-lab_c = lab_promedio(st.session_state["rgb_coche"])
-lab_m = lab_promedio(st.session_state["rgb_muestra"])
+rgb_c_cal = lista_calibrada("coche")
+rgb_m_cal = lista_calibrada("muestra")
+lab_c = lab_promedio(rgb_c_cal)
+lab_m = lab_promedio(rgb_m_cal)
 
 if lab_c and lab_m:
     dL = lab_c[0] - lab_m[0]
@@ -440,39 +641,53 @@ if lab_c and lab_m:
     pct = max(0.0, 100.0 - dE * 2)
 
     desc_dE, clase_dE = interpretar_dE(dE)
+    color_gauge = {"ok": "#16A34A", "mid": "#D97706", "bad": "#DC2626"}[clase_dE]
+    deg = max(0.0, min(100.0, pct)) * 3.6
 
     st.divider()
 
-    # Swatches de comparación
-    avg_c = rgb_promedio(st.session_state["rgb_coche"])
-    avg_m = rgb_promedio(st.session_state["rgb_muestra"])
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        st.markdown(
-            f'<div class="swatch" style="background:{hex_color(avg_c)}"></div>'
-            f'<p style="color:#666;font-size:.8rem;text-align:center;margin-top:4px">'
-            f'Objetivo — {hex_color(avg_c)}</p>',
-            unsafe_allow_html=True,
-        )
-    with sc2:
-        st.markdown(
-            f'<div class="swatch" style="background:{hex_color(avg_m)}"></div>'
-            f'<p style="color:#666;font-size:.8rem;text-align:center;margin-top:4px">'
-            f'Actual — {hex_color(avg_m)}</p>',
-            unsafe_allow_html=True,
-        )
+    ilu_c = st.session_state.get("ilu_coche")
+    ilu_m = st.session_state.get("ilu_muestra")
+    if ilu_c is not None and ilu_m is not None:
+        dist_ilu = diferencia_iluminantes(ilu_c, ilu_m)
+        if dist_ilu > 0.06:
+            st.warning(
+                "Las dos fotos parecen tomadas con una luz de tono distinto (una más cálida o fría que la otra). "
+                "Si puedes, repítelas con la misma iluminación, o usa la calibración por punto neutro en cada una.",
+                icon="💡",
+            )
+        elif dist_ilu > 0.03:
+            st.info("La iluminación entre ambas fotos no es idéntica, pero la diferencia es pequeña.", icon="💡")
 
-    # Caja de similitud
+    avg_c = rgb_promedio(rgb_c_cal)
+    avg_m = rgb_promedio(rgb_m_cal)
+
     st.markdown(f"""
-<div class="resultado-box">
-  <div style="color:#555;letter-spacing:2px;font-size:.8rem">SIMILITUD CROMÁTICA</div>
-  <div class="dE-val {clase_dE}">{pct:.1f}%</div>
-  <div style="color:#999;font-size:.85rem;margin-top:4px">{desc_dE}</div>
-  <div style="color:#555;font-size:.78rem;margin-top:8px">
-    ΔE = {dE:.2f} &nbsp;·&nbsp;
-    ΔL = {dL:+.2f} &nbsp;·&nbsp;
-    Δa* = {da:+.2f} &nbsp;·&nbsp;
-    Δb* = {db:+.2f}
+<div class="card" style="text-align:center;">
+  <div class="gauge-wrap">
+    <div class="gauge" style="--gauge-color:{color_gauge}; --gauge-deg:{deg:.1f};">
+      <div class="gauge-inner">
+        <div class="gauge-pct">{pct:.0f}%</div>
+        <div class="gauge-label">SIMILITUD</div>
+      </div>
+    </div>
+  </div>
+  <div class="dE-{clase_dE}" style="font-weight:700;margin-top:12px">{desc_dE}</div>
+  <div style="color:#8A94A6;font-size:.78rem;margin-top:6px">
+    ΔE = {dE:.2f} &nbsp;·&nbsp; ΔL = {dL:+.2f} &nbsp;·&nbsp; Δa* = {da:+.2f} &nbsp;·&nbsp; Δb* = {db:+.2f}
+  </div>
+  <div class="vs-row" style="margin-top:20px">
+    <div class="vs-swatch-box">
+      <div class="vs-swatch" style="background:{hex_color(avg_c)}"></div>
+      <div class="vs-label">Objetivo</div>
+      <div class="vs-hex">{hex_color(avg_c)}</div>
+    </div>
+    <div class="vs-versus">VS</div>
+    <div class="vs-swatch-box">
+      <div class="vs-swatch" style="background:{hex_color(avg_m)}"></div>
+      <div class="vs-label">Prueba</div>
+      <div class="vs-hex">{hex_color(avg_m)}</div>
+    </div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -510,6 +725,8 @@ if lab_c and lab_m:
                     len(st.session_state["rgb_coche"]),
                     len(st.session_state["rgb_muestra"]),
                     std_c_prom, std_m_prom, radio_muestra,
+                    st.session_state["factor_coche"] is not None,
+                    st.session_state["factor_muestra"] is not None,
                 ))
                 st.session_state["resultado_ia"] = full
             except anthropic.AuthenticationError:
