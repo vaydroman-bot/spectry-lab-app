@@ -136,6 +136,7 @@ ESTADO_POR_DEFECTO = {
     "calidad_coche": None, "calidad_muestra": None,
     "ilu_coche": None, "ilu_muestra": None,
     "resultado_ia": None,
+    "rerun_pendiente": False,
 }
 for k, v in ESTADO_POR_DEFECTO.items():
     if k not in st.session_state:
@@ -549,14 +550,14 @@ def bloque_imagen(titulo, sfx):
                 rgb_neutro, _ = muestrear_color(img_full, x_full, y_full, radio_muestra)
                 st.session_state[key_factor] = calcular_factor_calibracion(rgb_neutro)
                 st.session_state["resultado_ia"] = None
-                st.rerun()
+                st.session_state["rerun_pendiente"] = True
             else:
                 st.session_state[key_pts].append((coord["x"], coord["y"]))
                 rgb, std = muestrear_color(img_full, x_full, y_full, radio_muestra)
                 st.session_state[key_rgb].append(rgb)
                 st.session_state[key_std].append(std)
                 st.session_state["resultado_ia"] = None
-                st.rerun()
+                st.session_state["rerun_pendiente"] = True
 
         if st.session_state[key_factor] is not None:
             fb1, fb2 = st.columns([3, 1])
@@ -566,7 +567,7 @@ def bloque_imagen(titulo, sfx):
                 if st.button("Quitar", key=f"quitarcal_{sfx}"):
                     st.session_state[key_factor] = None
                     st.session_state["resultado_ia"] = None
-                    st.rerun()
+                    st.session_state["rerun_pendiente"] = True
 
         if not st.session_state[key_rgb]:
             return
@@ -610,7 +611,7 @@ def bloque_imagen(titulo, sfx):
                 st.session_state[key_std].pop()
                 st.session_state[key_prev] = None
                 st.session_state["resultado_ia"] = None
-                st.rerun()
+                st.session_state["rerun_pendiente"] = True
         with b2:
             if st.button("🗑️ Borrar todos", key=f"del_{sfx}"):
                 st.session_state[key_pts]  = []
@@ -618,7 +619,7 @@ def bloque_imagen(titulo, sfx):
                 st.session_state[key_std]  = []
                 st.session_state[key_prev] = None
                 st.session_state["resultado_ia"] = None
-                st.rerun()
+                st.session_state["rerun_pendiente"] = True
 
 # ── Layout 2 columnas ─────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
@@ -626,6 +627,15 @@ with col1:
     bloque_imagen("🚗 Color del Coche (objetivo)", "coche")
 with col2:
     bloque_imagen("🎨 Prueba del Taller (actual)", "muestra")
+
+# Si alguno de los dos bloques pidió un rerun (nuevo clic, calibración,
+# deshacer...), se dispara aquí UNA sola vez, después de que ambos paneles
+# ya terminaron de ejecutarse en esta pasada. Llamar a st.rerun() dentro de
+# bloque_imagen() interrumpía el script a mitad de la primera columna y el
+# file_uploader de la segunda perdía su archivo ya subido.
+if st.session_state["rerun_pendiente"]:
+    st.session_state["rerun_pendiente"] = False
+    st.rerun()
 
 # ── Resultados ────────────────────────────────────────────────────────────────
 rgb_c_cal = lista_calibrada("coche")
